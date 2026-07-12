@@ -92,10 +92,15 @@ def _write_outputs(results: list, diag_rows: list, full_rows: list,
         "max_workers": MAX_WORKERS,
         "hard_deadline_secs": HARD_DEADLINE_SECONDS,
         "deadline_forced_tasks": runinfo.get("deadline_forced_tasks", 0),
-        # Tasks answered by the zero-token rule lane — each one is a task
-        # that consumed no Fireworks tokens at all.
+        # Tasks answered by the zero-token lanes — each one is a task that
+        # consumed no Fireworks tokens at all.
         "local_rule_tasks": sum(
             1 for r in diag_rows if r.get("route") == "local_rule"),
+        "local_model_tasks": sum(
+            1 for r in diag_rows if r.get("route") == "local_model"),
+        # GGUF lazy-load evidence: 0.0/false when the model lane never fired.
+        "model_load_secs": runinfo.get("model_load_secs", 0.0),
+        "model_loaded": runinfo.get("model_loaded", False),
         # Token accounting (ranking metric): totals as reported by the API
         # client, plus a per-category breakdown for targeting reductions.
         "total_prompt_tokens": runinfo.get("total_prompt_tokens", 0),
@@ -132,10 +137,12 @@ def main() -> int:
     # Resolved role -> model map (from runtime ALLOWED_MODELS, never hardcoded)
     print(f"resolved model map: {router.resolved_map()}", flush=True)
     print(
-        f"hybrid mode: heuristic classifier, zero-token rule lane "
+        f"hybrid mode: heuristic classifier | rule lane "
         f"{'ON' if router.local_answers_enabled else 'OFF'} "
-        f"({','.join(sorted(router.local_answer_categories)) or '-'}), "
-        f"everything else dispatched to Fireworks "
+        f"({','.join(sorted(router.local_answer_categories)) or '-'}) | "
+        f"model lane {'ON' if router.local_model_enabled else 'OFF'} "
+        f"({','.join(sorted(router.local_model_categories)) or '-'}, "
+        f"backend={local_model.backend}) | rest -> Fireworks "
         f"(max_workers={MAX_WORKERS}, deadline={HARD_DEADLINE_SECONDS:.0f}s)",
         flush=True,
     )
@@ -160,6 +167,8 @@ def main() -> int:
         runinfo["total_prompt_tokens"] = getattr(fw, "total_prompt_tokens", 0)
         runinfo["total_completion_tokens"] = getattr(fw, "total_completion_tokens", 0)
         runinfo["total_tokens"] = getattr(fw, "total_tokens", 0)
+        runinfo["model_load_secs"] = getattr(local_model, "load_secs", 0.0)
+        runinfo["model_loaded"] = bool(getattr(local_model, "model_loaded", False))
         _write_outputs(results, diag_rows, full_rows, runinfo)
 
     elapsed = time.time() - CONTAINER_START_TS
