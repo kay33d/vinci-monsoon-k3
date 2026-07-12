@@ -64,6 +64,25 @@ def test_validation_rules():
     assert not _valid_local_answer("summarization", "")
 
 
+def test_exact_count_validation():
+    # The measured live failure: "exactly three bullet points" -> 4 bullets.
+    prompt3 = "Summarize the passage in exactly three bullet points."
+    four = "- flexibility\n- work-life balance improves\n- culture challenges\n- office rethink"
+    three = "- flexibility gains for employees\n- culture challenges persist\n- offices become social hubs"
+    assert not _valid_local_answer("summarization", four, prompt3)
+    assert _valid_local_answer("summarization", three, prompt3)
+
+    prompt2 = "Summarize the following passage in exactly two sentences: ..."
+    two = "ML is widely used in healthcare. However, concerns about bias persist."
+    one = "ML is widely used in healthcare despite concerns."
+    assert _valid_local_answer("summarization", two, prompt2)
+    assert not _valid_local_answer("summarization", one, prompt2)
+
+    # No "exactly N" in the prompt -> no count constraint.
+    assert _valid_local_answer("summarization", four,
+                               "Summarize the passage briefly.")
+
+
 # --------------------------------------------------------------------------- #
 # lane behaviour                                                               #
 # --------------------------------------------------------------------------- #

@@ -87,14 +87,40 @@ def _env_flag(name: str, default: bool) -> bool:
 _SENTIMENT_LABEL = re.compile(r"\b(positive|negative|neutral|mixed)\b", re.IGNORECASE)
 _REFUSAL = re.compile(r"\b(i can'?t|i cannot|as an ai|i'?m sorry|i am sorry)\b", re.IGNORECASE)
 
+# "exactly two sentences" / "exactly 3 bullet points": small local models
+# sometimes miscount (measured: 1.5B gave 4 bullets for "exactly three").
+# The judge grades format compliance, so a count mismatch must escalate.
+_WORD_NUM = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+             "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
+_EXACT_COUNT = re.compile(
+    r"exactly\s+(\d+|" + "|".join(_WORD_NUM) + r")\s+"
+    r"(sentence|bullet|point|line|word)", re.IGNORECASE)
+_BULLET_LINE = re.compile(r"^\s*([-*•]|\d+[.)])\s+\S")
 
-def _valid_local_answer(category: str, text: str) -> bool:
+
+def _requested_count_ok(prompt: str, text: str) -> bool:
+    m = _EXACT_COUNT.search(prompt)
+    if not m:
+        return True
+    want = int(m.group(1)) if m.group(1).isdigit() else _WORD_NUM[m.group(1).lower()]
+    unit = m.group(2).lower()
+    if unit == "word":
+        return len(text.split()) == want
+    if unit in ("bullet", "point", "line"):
+        got = sum(1 for ln in text.splitlines() if _BULLET_LINE.match(ln))
+    else:  # sentences: split at terminator + following capital/quote
+        got = len([s for s in re.split(r"(?<=[.!?])\s+(?=[A-Z\"'(])",
+                                       text.strip()) if s.strip()])
+    return got == want
+
+
+def _valid_local_answer(category: str, text: str, prompt: str = "") -> bool:
     if not text or len(text.strip()) < 3 or _REFUSAL.search(text[:120]):
         return False
     if category == "sentiment":
         return bool(_SENTIMENT_LABEL.search(text[:200]))
     if category == "summarization":
-        return len(text.split()) >= 5
+        return len(text.split()) >= 5 and _requested_count_ok(prompt, text)
     return True
 
 
@@ -335,7 +361,7 @@ class Router:
         timing["primary_secs"] = gen_secs
         with self._lm_spent_lock:
             self._lm_spent += gen_secs
-        if text and _valid_local_answer(category, text):
+        if text and _valid_local_answer(category, text, prompt):
             return text
         return None  # invalid / empty -> remote path takes over
 
