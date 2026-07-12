@@ -92,6 +92,10 @@ def _write_outputs(results: list, diag_rows: list, full_rows: list,
         "max_workers": MAX_WORKERS,
         "hard_deadline_secs": HARD_DEADLINE_SECONDS,
         "deadline_forced_tasks": runinfo.get("deadline_forced_tasks", 0),
+        # Tasks answered by the zero-token rule lane — each one is a task
+        # that consumed no Fireworks tokens at all.
+        "local_rule_tasks": sum(
+            1 for r in diag_rows if r.get("route") == "local_rule"),
         # Token accounting (ranking metric): totals as reported by the API
         # client, plus a per-category breakdown for targeting reductions.
         "total_prompt_tokens": runinfo.get("total_prompt_tokens", 0),
@@ -128,9 +132,11 @@ def main() -> int:
     # Resolved role -> model map (from runtime ALLOWED_MODELS, never hardcoded)
     print(f"resolved model map: {router.resolved_map()}", flush=True)
     print(
-        f"all-remote mode: heuristic classifier, every task dispatched to "
-        f"Fireworks (max_workers={MAX_WORKERS}, "
-        f"deadline={HARD_DEADLINE_SECONDS:.0f}s)",
+        f"hybrid mode: heuristic classifier, zero-token rule lane "
+        f"{'ON' if router.local_answers_enabled else 'OFF'} "
+        f"({','.join(sorted(router.local_answer_categories)) or '-'}), "
+        f"everything else dispatched to Fireworks "
+        f"(max_workers={MAX_WORKERS}, deadline={HARD_DEADLINE_SECONDS:.0f}s)",
         flush=True,
     )
 

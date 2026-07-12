@@ -1,11 +1,15 @@
 """Stage 2 — routing decision + category->role->model resolution.
 
-ALL-REMOTE MODE. Decision flow per task (thread-safe; the entrypoint calls
-``route`` from a ThreadPoolExecutor):
+REMOTE-FIRST WITH A ZERO-TOKEN LOCAL RULE LANE. Decision flow per task
+(thread-safe; the entrypoint calls ``route`` from a ThreadPoolExecutor):
   1. classify with the deterministic keyword heuristic (0 tokens, instant)
-  2. resolve category -> role -> concrete model ID from runtime
+  2. LOCAL RULE lane (config ``local_answers``): provably-easy tasks —
+     clearly one-sided sentiment, pure-arithmetic math — are answered
+     deterministically for 0 Fireworks tokens (the ranking metric). The
+     lane returns None for anything ambiguous, which falls through to:
+  3. resolve category -> role -> concrete model ID from runtime
      ALLOWED_MODELS (never hardcoded; graceful fallback to first allowed)
-  3. call the primary model ONCE (client retries transients internally,
+  4. call the primary model ONCE (client retries transients internally,
      4xx permanent). EMPTY content only -> one attempt on the OTHER allowed
      model. If everything fails -> deterministic non-empty fallback answer.
 There is no per-task budget any more: each HTTP call is bounded by
@@ -27,6 +31,7 @@ from config.prompts import REMOTE_SYSTEM, remote_user_prompt
 from src.api_clients.fireworks import EmptyCompletion, FireworksClient, FireworksError
 from src.local_models.loader import LocalModel
 from src.router.classifier import classify_task
+from src.router.local_answers import try_local_answer
 
 _CONFIG_PATH = Path(__file__).resolve().parents[2] / "config" / "routing_map.yaml"
 
@@ -74,7 +79,20 @@ class Router:
         self.thresholds = self.cfg.get("thresholds", {})
         # Heuristic backend (always, since the GGUF was removed) forces
         # EVERY task remote — local text is only the last-resort fallback.
+        # (The LOCAL RULE lane below is independent of this: it is exact by
+        # construction, not a weak-model answer.)
         self.force_all_remote = getattr(local_model, "backend", "") == "heuristic"
+        # Zero-token rule lane: config-driven, env-overridable for A/B runs
+        # (LOCAL_ANSWERS=0 disables, =1 forces on, unset -> config value).
+        la_cfg = self.cfg.get("local_answers", {})
+        env_flag = os.environ.get("LOCAL_ANSWERS", "").strip().lower()
+        if env_flag in ("0", "false", "off"):
+            self.local_answers_enabled = False
+        elif env_flag in ("1", "true", "on"):
+            self.local_answers_enabled = True
+        else:
+            self.local_answers_enabled = bool(la_cfg.get("enabled", False))
+        self.local_answer_categories = set(la_cfg.get("categories", []))
 
     # ------------------------------------------------------------------ #
     # role -> concrete allowed model ID                                   #
@@ -175,6 +193,16 @@ class Router:
             answer = self._local_answer(task_prompt)
             timing["total_secs"] = round(time.time() - t_start, 2)
             return answer, meta
+
+        # LOCAL RULE lane: exact deterministic answer for 0 tokens, or None
+        # to escalate. Tried BEFORE any remote resolution so a hit spends
+        # neither tokens nor network time.
+        if self.local_answers_enabled and category in self.local_answer_categories:
+            rule_answer = try_local_answer(category, task_prompt)
+            if rule_answer:
+                meta.update(route="local_rule", model="rule")
+                timing["total_secs"] = round(time.time() - t_start, 2)
+                return rule_answer, meta
 
         if self.should_answer_locally(decision, task_prompt):
             return _finish_local()

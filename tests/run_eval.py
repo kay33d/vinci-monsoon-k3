@@ -132,7 +132,8 @@ def run_offline_eval(output_path: Path | None = None, live: bool | None = None) 
     real_success = live and route_counts["remote"] > 0
     print(
         f"SUMMARY mode={'live' if live else 'mock'} tasks={len(results)} "
-        f"local={route_counts['local']} remote={route_counts['remote']} "
+        f"local={route_counts['local']} rule={route_counts.get('local_rule', 0)} "
+        f"remote={route_counts['remote']} "
         f"fallback={route_counts['local_fallback']} "
         f"calls={client.calls} tokens={client.total_tokens} "
         f"real_fireworks_success={str(real_success).lower()}"

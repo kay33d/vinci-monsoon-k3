@@ -64,6 +64,17 @@ escalation_policy:
     # emits junk on dense NER -> force remote via general role (minimax-m3).
     ner: always
 
+# --- Zero-token LOCAL RULE lane ----------------------------------------------
+# Deterministic answers for provably-easy tasks (src/router/local_answers.py):
+# clearly one-sided sentiment and pure-arithmetic math. Every hit costs 0
+# Fireworks tokens (the ranking metric). The rules refuse anything ambiguous
+# (negation, contrast conjunctions, word problems), which falls through to
+# the normal remote path — so enabling this cannot make an answer WORSE,
+# only cheaper. Env override for A/B integration runs: LOCAL_ANSWERS=0/1.
+local_answers:
+  enabled: true
+  categories: [sentiment, math_reasoning]
+
 # --- Generation limits -------------------------------------------------------
 limits:
   classify_max_tokens: 64      # stage-1 JSON is tiny; keep latency low
