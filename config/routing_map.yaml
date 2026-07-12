@@ -75,28 +75,6 @@ local_answers:
   enabled: true
   categories: [sentiment, math_reasoning]
 
-# --- LOCAL MODEL lane (quantized Qwen GGUF, 0 Fireworks tokens) --------------
-# The bundled GGUF answers ONLY the categories a small instruct model is
-# historically reliable at; math/logic/code/NER stay remote (NER was a
-# measured accuracy leak on the old 3B, code/math small-model answers cost
-# gate points). Output validation in dispatch.py escalates any weak answer
-# to Fireworks, so the lane trades tokens for time, never for accuracy.
-# Time gates (all seconds, anchored at process launch):
-#   time_budget_secs   cumulative GGUF generation allowed per run
-#   latest_start_secs  no NEW local generation may start after this point
-# Worst case: latest_start (350) + one generation (<=60 realistic on 2 vCPU
-# with these caps) = ~410s, inside the 500s global deadline with margin.
-# Env kill switch for A/B integration runs: LOCAL_MODEL=0/1.
-local_model:
-  enabled: true
-  categories: [sentiment, summarization]
-  max_prompt_chars: 2600     # long passages -> remote (CPU prompt-eval is slow)
-  max_tokens:
-    sentiment: 80            # label + one-sentence justification
-    summarization: 220       # room for "exactly N sentences/bullets" formats
-  time_budget_secs: 240
-  latest_start_secs: 350
-
 # --- Generation limits -------------------------------------------------------
 limits:
   classify_max_tokens: 64      # stage-1 JSON is tiny; keep latency low
