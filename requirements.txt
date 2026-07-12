@@ -1,5 +1,7 @@
 # Runtime dependencies (keep lean — these ship in the submission image).
-# llama-cpp-python was removed with the local GGUF: the agent now runs in
-# all-remote mode (heuristic classification, Fireworks for every answer).
 requests>=2.31,<3
 PyYAML>=6.0,<7
+# CPU-only llama.cpp bindings for the LOCAL MODEL lane (quantized Qwen GGUF
+# answers sentiment/summarization for 0 Fireworks tokens). Compiled in the
+# Docker builder stage with GGML_NATIVE=OFF for a portable amd64 binary.
+llama-cpp-python>=0.3,<0.4
