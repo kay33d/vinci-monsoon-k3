@@ -1,46 +1,43 @@
 """Stage 2 — routing decision + category->role->model resolution.
 
-HYBRID: TWO ZERO-TOKEN LOCAL LANES, THEN REMOTE. Decision flow per task
+REMOTE-FIRST WITH A ZERO-TOKEN LOCAL RULE LANE. Decision flow per task
 (thread-safe; the entrypoint calls ``route`` from a ThreadPoolExecutor):
   1. classify with the deterministic keyword heuristic (0 tokens, instant)
   2. LOCAL RULE lane (config ``local_answers``): provably-easy tasks —
      clearly one-sided sentiment, pure-arithmetic math — are answered
-     deterministically for 0 Fireworks tokens (the ranking metric).
-  3. LOCAL MODEL lane (config ``local_model``): the bundled quantized Qwen
-     GGUF answers the categories it is historically reliable at (sentiment,
-     summarization by default) — also 0 Fireworks tokens. Guarded by hard
-     time gates (cumulative generation budget + a latest-start cutoff) so a
-     slow grading CPU can never push the run past the global deadline, and
-     by per-category output validation: an answer that fails validation
-     falls through to remote exactly as if the lane didn't exist.
-  4. resolve category -> role -> concrete model ID from runtime
+     deterministically for 0 Fireworks tokens (the ranking metric). The
+     lane returns None for anything ambiguous, which falls through to:
+  3. resolve category -> role -> concrete model ID from runtime
      ALLOWED_MODELS (never hardcoded; graceful fallback to first allowed)
-  5. call the primary model ONCE (client retries transients internally,
+  4. call the primary model ONCE (client retries transients internally,
      4xx permanent). EMPTY content only -> one attempt on the OTHER allowed
      model. If everything fails -> deterministic non-empty fallback answer.
-Local generation is serialized behind the model lock while remote tasks run
-in parallel around it; each HTTP call is bounded by remote_timeout_seconds,
-and the GLOBAL 500s deadline in entrypoint.py is the run-level guard.
+There is no per-task budget any more: each HTTP call is bounded by
+remote_timeout_seconds, and the GLOBAL 500s deadline in entrypoint.py is the
+run-level guard.
 """
 
 from __future__ import annotations
 
 import os
 import re
-import threading
 import time
 from pathlib import Path
 from typing import Optional
 
 import yaml
 
-from config.prompts import LOCAL_ANSWER_SYSTEM, REMOTE_SYSTEM, remote_user_prompt
+from config.prompts import REMOTE_SYSTEM, remote_user_prompt
 from src.api_clients.fireworks import EmptyCompletion, FireworksClient, FireworksError
 from src.local_models.loader import LocalModel
 from src.router.classifier import classify_task
 from src.router.local_answers import try_local_answer
 
 _CONFIG_PATH = Path(__file__).resolve().parents[2] / "config" / "routing_map.yaml"
+
+# The stage-1 classifier emits categorical confidence; map it to a score so
+# the config threshold (local_confidence_threshold) can gate it numerically.
+_CONFIDENCE_SCORE = {"high": 0.95, "low": 0.50}
 
 # --- Aggressive escalation cues (kept for diag visibility) ------------------
 _CODE_CUES = re.compile(
@@ -71,59 +68,6 @@ def allowed_models() -> list[str]:
     return [m.strip() for m in raw.split(",") if m.strip()]
 
 
-def _env_flag(name: str, default: bool) -> bool:
-    """0/false/off disables, 1/true/on enables, unset -> config default."""
-    val = os.environ.get(name, "").strip().lower()
-    if val in ("0", "false", "off"):
-        return False
-    if val in ("1", "true", "on"):
-        return True
-    return default
-
-
-# Local-model output validation: an answer that fails its category check is
-# discarded and the task escalates to Fireworks — the lane can only ever
-# REPLACE a remote call with an equally-acceptable answer, never degrade one.
-_SENTIMENT_LABEL = re.compile(r"\b(positive|negative|neutral|mixed)\b", re.IGNORECASE)
-_REFUSAL = re.compile(r"\b(i can'?t|i cannot|as an ai|i'?m sorry|i am sorry)\b", re.IGNORECASE)
-
-# "exactly two sentences" / "exactly 3 bullet points": small local models
-# sometimes miscount (measured: 1.5B gave 4 bullets for "exactly three").
-# The judge grades format compliance, so a count mismatch must escalate.
-_WORD_NUM = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
-             "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
-_EXACT_COUNT = re.compile(
-    r"exactly\s+(\d+|" + "|".join(_WORD_NUM) + r")\s+"
-    r"(sentence|bullet|point|line|word)", re.IGNORECASE)
-_BULLET_LINE = re.compile(r"^\s*([-*•]|\d+[.)])\s+\S")
-
-
-def _requested_count_ok(prompt: str, text: str) -> bool:
-    m = _EXACT_COUNT.search(prompt)
-    if not m:
-        return True
-    want = int(m.group(1)) if m.group(1).isdigit() else _WORD_NUM[m.group(1).lower()]
-    unit = m.group(2).lower()
-    if unit == "word":
-        return len(text.split()) == want
-    if unit in ("bullet", "point", "line"):
-        got = sum(1 for ln in text.splitlines() if _BULLET_LINE.match(ln))
-    else:  # sentences: split at terminator + following capital/quote
-        got = len([s for s in re.split(r"(?<=[.!?])\s+(?=[A-Z\"'(])",
-                                       text.strip()) if s.strip()])
-    return got == want
-
-
-def _valid_local_answer(category: str, text: str, prompt: str = "") -> bool:
-    if not text or len(text.strip()) < 3 or _REFUSAL.search(text[:120]):
-        return False
-    if category == "sentiment":
-        return bool(_SENTIMENT_LABEL.search(text[:200]))
-    if category == "summarization":
-        return len(text.split()) >= 5 and _requested_count_ok(prompt, text)
-    return True
-
-
 class Router:
     def __init__(self, local_model: LocalModel, fireworks: FireworksClient,
                  config: Optional[dict] = None):
@@ -133,34 +77,22 @@ class Router:
         self.allowed = allowed_models()
         self.limits = self.cfg.get("limits", {})
         self.thresholds = self.cfg.get("thresholds", {})
-        # Without a usable GGUF (backend == "heuristic") every task that the
-        # rule lane doesn't catch goes remote — deterministic fallback text
-        # is only for total remote failure. (The RULE lane is independent:
-        # it is exact by construction, not a weak-model answer.)
+        # Heuristic backend (always, since the GGUF was removed) forces
+        # EVERY task remote — local text is only the last-resort fallback.
+        # (The LOCAL RULE lane below is independent of this: it is exact by
+        # construction, not a weak-model answer.)
         self.force_all_remote = getattr(local_model, "backend", "") == "heuristic"
         # Zero-token rule lane: config-driven, env-overridable for A/B runs
         # (LOCAL_ANSWERS=0 disables, =1 forces on, unset -> config value).
         la_cfg = self.cfg.get("local_answers", {})
-        self.local_answers_enabled = _env_flag("LOCAL_ANSWERS",
-                                               bool(la_cfg.get("enabled", False)))
+        env_flag = os.environ.get("LOCAL_ANSWERS", "").strip().lower()
+        if env_flag in ("0", "false", "off"):
+            self.local_answers_enabled = False
+        elif env_flag in ("1", "true", "on"):
+            self.local_answers_enabled = True
+        else:
+            self.local_answers_enabled = bool(la_cfg.get("enabled", False))
         self.local_answer_categories = set(la_cfg.get("categories", []))
-        # LOCAL MODEL lane (quantized GGUF). All knobs from config; the env
-        # kill switch LOCAL_MODEL=0/1 exists for A/B integration runs.
-        lm_cfg = self.cfg.get("local_model", {})
-        self.local_model_enabled = (
-            _env_flag("LOCAL_MODEL", bool(lm_cfg.get("enabled", False)))
-            and getattr(local_model, "backend", "") == "gguf-lazy"
-        )
-        self.local_model_categories = set(lm_cfg.get("categories", []))
-        self.lm_max_prompt_chars = int(lm_cfg.get("max_prompt_chars", 2600))
-        self.lm_max_tokens = lm_cfg.get("max_tokens", {}) or {}
-        self.lm_time_budget = float(lm_cfg.get("time_budget_secs", 240))
-        self.lm_latest_start = float(lm_cfg.get("latest_start_secs", 350))
-        # Router construction happens right after process launch, so this
-        # anchor approximates container start for the model lane's gates.
-        self._t0 = time.time()
-        self._lm_spent = 0.0                    # cumulative GGUF generation secs
-        self._lm_spent_lock = threading.Lock()
 
     # ------------------------------------------------------------------ #
     # role -> concrete allowed model ID                                   #
@@ -200,6 +132,22 @@ class Router:
         if _REASONING_CUES.search(prompt):
             return "reasoning_cue"
         return None
+
+    def should_answer_locally(self, decision: dict, prompt: str) -> bool:
+        if self.force_all_remote:
+            return False
+        policy_cfg = self.cfg.get("escalation_policy", {})
+        policy = policy_cfg.get("overrides", {}).get(
+            decision["intent"], policy_cfg.get("default", "strict")
+        )
+        if policy == "always":
+            return False
+        if decision["difficulty"] != "shallow":
+            return False
+        conf = _CONFIDENCE_SCORE.get(decision.get("confidence"), 0.0)
+        if conf <= self.thresholds.get("local_confidence_threshold", 0.90):
+            return False
+        return True
 
     # ------------------------------------------------------------------ #
     # full pipeline for one task (runs inside a worker thread)            #
@@ -256,15 +204,8 @@ class Router:
                 timing["total_secs"] = round(time.time() - t_start, 2)
                 return rule_answer, meta
 
-        # LOCAL MODEL lane: quantized GGUF answer for 0 tokens. Validation
-        # failure or any time-gate refusal falls through to remote.
-        if self._local_model_eligible(category, task_prompt):
-            lm_answer = self._try_local_model(category, task_prompt, timing)
-            if lm_answer:
-                meta.update(route="local_model",
-                            model=os.path.basename(self.local.model_path))
-                timing["total_secs"] = round(time.time() - t_start, 2)
-                return lm_answer, meta
+        if self.should_answer_locally(decision, task_prompt):
+            return _finish_local()
 
         primary = self.resolve_model(category)
         if primary is None:  # ALLOWED_MODELS empty: fallback is all we have
@@ -329,41 +270,6 @@ class Router:
 
         # Remote attempts failed — degrade to the deterministic fallback.
         return _finish_local("local_fallback", str(last_err) if last_err else "remote unavailable")
-
-    # ------------------------------------------------------------------ #
-    # LOCAL MODEL lane                                                    #
-    # ------------------------------------------------------------------ #
-    def _local_model_eligible(self, category: str, prompt: str) -> bool:
-        """Hard gates that keep the GGUF lane provably inside the deadline:
-        the lane refuses long prompts (CPU prompt-eval is the slow part),
-        refuses once the cumulative generation budget is spent, and refuses
-        to START a generation late in the run."""
-        if not self.local_model_enabled or category not in self.local_model_categories:
-            return False
-        if len(prompt) > self.lm_max_prompt_chars:
-            return False
-        elapsed = time.time() - self._t0
-        if elapsed > self.lm_latest_start:
-            return False
-        with self._lm_spent_lock:
-            return self._lm_spent < self.lm_time_budget
-
-    def _try_local_model(self, category: str, prompt: str,
-                         timing: dict) -> Optional[str]:
-        max_tokens = int(self.lm_max_tokens.get(category, 160))
-        t0 = time.time()
-        text = self.local.llm_answer(
-            system=LOCAL_ANSWER_SYSTEM,
-            user=remote_user_prompt(category, prompt),
-            max_tokens=max_tokens,
-        )
-        gen_secs = round(time.time() - t0, 2)
-        timing["primary_secs"] = gen_secs
-        with self._lm_spent_lock:
-            self._lm_spent += gen_secs
-        if text and _valid_local_answer(category, text, prompt):
-            return text
-        return None  # invalid / empty -> remote path takes over
 
     def _local_answer(self, task_prompt: str) -> str:
         return self.local.generate(
