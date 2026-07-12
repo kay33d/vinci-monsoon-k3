@@ -2,7 +2,9 @@ name: build
 
 on:
   push:
-    branches: [main]
+    # claude/** so fork-side development branches also build + publish an
+    # image (into THIS repo's GHCR namespace, see the image step below).
+    branches: [main, "claude/**"]
   # Manual trigger for the live Fireworks integration test (integration-test
   # job below). NOTE: the defaults are PLACEHOLDERS for plumbing validation
   # only — the REAL FIREWORKS_BASE_URL / ALLOWED_MODELS are injected by the
@@ -59,7 +61,13 @@ jobs:
         id: sha
         run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
-      # GHCR requires a lowercase repository path.
+      # GHCR requires a lowercase repository path. Derived from the repo the
+      # workflow runs in (NOT hardcoded) so forks publish to their own
+      # namespace instead of failing against the upstream one.
+      - name: Compute image path
+        id: img
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
       # Two tags per build: :latest is the moving submission pointer, and
       # :<short-sha> (7 chars) is an immutable version so every graded image
       # remains pullable and traceable to its exact commit.
@@ -70,8 +78,8 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ghcr.io/jubayeronrob/vinci-monsoon:latest
-            ghcr.io/jubayeronrob/vinci-monsoon:${{ steps.sha.outputs.short }}
+            ${{ steps.img.outputs.image }}:latest
+            ${{ steps.img.outputs.image }}:${{ steps.sha.outputs.short }}
 
       # Run the freshly pushed image exactly like the grading harness:
       # tasks mounted at /input, results expected at /output/results.json.
@@ -83,7 +91,7 @@ jobs:
           docker run --rm \
             -v "$PWD/tests/mock_tasks.json:/input/tasks.json:ro" \
             -v "$PWD/out:/output" \
-            ghcr.io/jubayeronrob/vinci-monsoon:latest
+            "${{ steps.img.outputs.image }}:latest"
 
       - name: Validate results schema
         run: |
@@ -101,7 +109,7 @@ jobs:
 
       - name: Report compressed image size
         run: |
-          IMG=ghcr.io/jubayeronrob/vinci-monsoon:latest
+          IMG="${{ steps.img.outputs.image }}:latest"
           RAW=$(docker buildx imagetools inspect --raw "$IMG")
           # buildx pushes an OCI image index; drill into the linux/amd64
           # manifest to sum its layer sizes. Handle a bare manifest too.
@@ -146,8 +154,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Compute image path
+        id: img
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
       - name: Pull published image (no rebuild)
-        run: docker pull ghcr.io/jubayeronrob/vinci-monsoon:latest
+        run: docker pull "${{ steps.img.outputs.image }}:latest"
 
       - name: Run container with live env (vars passed BY NAME)
         run: |
@@ -156,7 +168,7 @@ jobs:
             -e FIREWORKS_API_KEY -e FIREWORKS_BASE_URL -e ALLOWED_MODELS \
             -v "$PWD/tests/mock_tasks.json:/input/tasks.json:ro" \
             -v "$PWD/out:/output" \
-            ghcr.io/jubayeronrob/vinci-monsoon:latest
+            "${{ steps.img.outputs.image }}:latest"
 
       - name: Validate container results schema
         run: |
